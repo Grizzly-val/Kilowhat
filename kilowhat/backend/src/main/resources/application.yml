@@ -1,0 +1,33 @@
+# Every value below can be overridden with the environment variable named in ${...}.
+server:
+  address: ${KILOWHAT_BIND_ADDRESS:0.0.0.0}   # 0.0.0.0 so a phone on the same Wi-Fi can reach the backend
+  port: ${KILOWHAT_PORT:8080}
+  error:
+    include-stacktrace: never
+    include-message: never
+
+spring:
+  application:
+    name: kilowhat-backend
+  datasource:
+    url: ${KILOWHAT_DB_URL:jdbc:mariadb://127.0.0.1:3306/kilowhat_db}
+    username: ${KILOWHAT_DB_USER:root}
+    password: ${KILOWHAT_DB_PASSWORD:}
+    driver-class-name: org.mariadb.jdbc.Driver
+    hikari:
+      maximum-pool-size: 5
+      # Fail fast (and answer 503) instead of hanging when XAMPP MySQL is stopped.
+      connection-timeout: 3000
+      validation-timeout: 2000
+      data-source-properties:
+        connectTimeout: 3000
+  sql:
+    init:
+      mode: never   # The schema is managed by database/kilowhat_init.sql; the backend never runs DDL.
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    time-zone: UTC
+    serialization:
+      write-dates-as-timestamps: false
+    generator:
+      write-bigdecimal-as-plain: true
