@@ -14,8 +14,8 @@ plugins {
 //   2. Physical phone (LAN): http://<PC_LAN_IP>:8080/ and http://<PC_LAN_IP>:8001/
 //   3. USB adb reverse:      http://localhost:8080/ and http://localhost:8001/
 // ============================================================================
-val backendBaseUrl = (project.findProperty("BACKEND_BASE_URL") as String?) ?: "http://10.0.2.2:8080/"
-val simulatorBaseUrl = (project.findProperty("SIMULATOR_BASE_URL") as String?) ?: "http://10.0.2.2:8001/"
+val backendBaseUrl = (project.findProperty("BACKEND_BASE_URL") as String?) ?: "http://192.168.18.68:8080/"
+val simulatorBaseUrl = (project.findProperty("SIMULATOR_BASE_URL") as String?) ?: "http://192.168.18.68:8001/"
 
 android {
     namespace = "com.kilowhat.app"

@@ -1,7 +1,11 @@
 package com.kilowhat.app.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.kilowhat.app.data.ble.BleState
+import com.kilowhat.app.data.ble.KilowhatBleClient
+import com.kilowhat.app.data.ble.Telemetry
 import com.kilowhat.app.data.model.ApplianceSummaryDto
 import com.kilowhat.app.data.model.GroupSummaryDto
 import com.kilowhat.app.data.model.SessionItemDto
@@ -19,6 +23,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
+enum class ConnectionSource {
+    NONE,
+    DEMO_SCRIPT,
+    BLE
+}
+
 data class RealtimeUiState(
     val isConnected: Boolean = false,
     val isPairing: Boolean = false,
@@ -32,7 +42,14 @@ data class RealtimeUiState(
     val activeApplianceDisplayName: String? = null,
     val isEditOutletDialogOpen: Boolean = false,
     val isSavingOutletName: Boolean = false,
-    val outletDialogError: String? = null
+    val outletDialogError: String? = null,
+    val connectionSource: ConnectionSource = ConnectionSource.NONE,
+    val bleState: BleState = BleState.Idle,
+    val isStreamStale: Boolean = false,
+    val isPermissionDenied: Boolean = false,
+    val energyWh: Double? = null,
+    val frequency: Double? = null,
+    val powerFactor: Double? = null
 ) {
     val isAppliancePluggedIn: Boolean
         get() = activeApplianceRfid.isNotBlank() && !activeApplianceRfid.equals("NONE", ignoreCase = true)
@@ -46,6 +63,13 @@ data class RealtimeUiState(
 
     val isGridSurgeWarning: Boolean
         get() = voltage >= 242.0 || (!isAppliancePluggedIn && watts > 0.5)
+
+    val isBleBusy: Boolean
+        get() = connectionSource == ConnectionSource.BLE && (
+            bleState is BleState.Scanning ||
+                bleState is BleState.Connecting ||
+                bleState is BleState.Reconnecting
+            )
 }
 
 data class DevicesUiState(
@@ -93,14 +117,22 @@ data class NamingDialogUiState(
 )
 
 /**
- * Activity-scoped ViewModel managing both the Real-Time BLE stream and the Devices ledger.
- * Scoping to MainActivity guarantees that switching bottom tabs or rotating the device never
- * interrupts the 1 Hz simulator polling loop, and that dynamic ledger renames propagate
- * immediately across all views.
+ * Activity-scoped ViewModel managing both the Real-Time stream (Demo PY Script or Real BLE)
+ * and the Devices ledger. Scoping to MainActivity guarantees that switching bottom tabs or
+ * rotating the device never interrupts the active connection, and that dynamic ledger renames
+ * propagate immediately across all views.
  */
 class KilowhatViewModel(
-    private val repository: KilowhatRepository = KilowhatRepository()
-) : ViewModel() {
+    application: Application,
+    private val repository: KilowhatRepository,
+    private val bleClient: KilowhatBleClient
+) : AndroidViewModel(application) {
+
+    constructor(application: Application) : this(
+        application = application,
+        repository = KilowhatRepository(),
+        bleClient = KilowhatBleClient(application.applicationContext)
+    )
 
     private val _realtimeState = MutableStateFlow(RealtimeUiState())
     val realtimeState: StateFlow<RealtimeUiState> = _realtimeState.asStateFlow()
@@ -121,7 +153,191 @@ class KilowhatViewModel(
     private val applianceNameCache = ConcurrentHashMap<String, String>()
 
     private var streamJob: Job? = null
+    private var applianceLookupJob: Job? = null
     private var outletLookupIdInFlight: String? = null
+    private var lastStreamRfid: String? = null
+    private var lastResolvedOutletId: String? = null
+
+    init {
+        observeBleClient()
+    }
+
+    private fun observeBleClient() {
+        viewModelScope.launch {
+            bleClient.state.collect { bleState ->
+                if (_realtimeState.value.connectionSource != ConnectionSource.BLE &&
+                    bleState is BleState.Idle
+                ) {
+                    return@collect
+                }
+
+                when (bleState) {
+                    is BleState.Idle -> {
+                        if (_realtimeState.value.connectionSource == ConnectionSource.BLE) {
+                            _realtimeState.update {
+                                it.copy(
+                                    bleState = BleState.Idle,
+                                    isConnected = false,
+                                    isStreamStale = false
+                                )
+                            }
+                        }
+                    }
+
+                    is BleState.Scanning -> {
+                        _realtimeState.update {
+                            it.copy(
+                                connectionSource = ConnectionSource.BLE,
+                                bleState = bleState,
+                                isConnected = false,
+                                isPairing = false,
+                                connectionError = null,
+                                isPermissionDenied = false,
+                                isStreamStale = false
+                            )
+                        }
+                    }
+
+                    is BleState.Connecting -> {
+                        _realtimeState.update {
+                            it.copy(
+                                connectionSource = ConnectionSource.BLE,
+                                bleState = bleState,
+                                isConnected = false,
+                                isPairing = false,
+                                connectionError = null,
+                                isPermissionDenied = false,
+                                isStreamStale = false
+                            )
+                        }
+                    }
+
+                    is BleState.Connected -> {
+                        val inferredOutletId = bleState.deviceName
+                            .removePrefix(KilowhatBleClient.DEVICE_NAME_PREFIX)
+                            .takeIf {
+                                it.isNotBlank() &&
+                                    bleState.deviceName.startsWith(KilowhatBleClient.DEVICE_NAME_PREFIX)
+                            }
+                            .orEmpty()
+
+                        _realtimeState.update { state ->
+                            val effectiveOutletId = state.outletId.ifBlank { inferredOutletId }
+                            state.copy(
+                                connectionSource = ConnectionSource.BLE,
+                                bleState = bleState,
+                                isConnected = true,
+                                isPairing = false,
+                                connectionError = null,
+                                isPermissionDenied = false,
+                                outletId = effectiveOutletId,
+                                energyWh = state.energyWh ?: 0.0,
+                                frequency = state.frequency ?: 0.0,
+                                powerFactor = state.powerFactor ?: 0.0
+                            )
+                        }
+
+                        val outletToResolve = _realtimeState.value.outletId
+                        if (outletToResolve.isNotBlank() && outletToResolve != lastResolvedOutletId) {
+                            lastResolvedOutletId = outletToResolve
+                            resolveOutletName(outletToResolve)
+                        }
+                    }
+
+                    is BleState.Reconnecting -> {
+                        lastStreamRfid = null
+                        _realtimeState.update { state ->
+                            state.copy(
+                                connectionSource = ConnectionSource.BLE,
+                                bleState = bleState,
+                                isPairing = false,
+                                connectionError = null,
+                                isStreamStale = false
+                            )
+                        }
+                    }
+
+                    is BleState.Error -> {
+                        lastStreamRfid = null
+                        _realtimeState.update { state ->
+                            state.copy(
+                                connectionSource = ConnectionSource.BLE,
+                                bleState = bleState,
+                                isConnected = false,
+                                isPairing = false,
+                                isStreamStale = false,
+                                connectionError = bleState.message
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            bleClient.isStale.collect { stale ->
+                if (_realtimeState.value.connectionSource == ConnectionSource.BLE) {
+                    _realtimeState.update { it.copy(isStreamStale = stale) }
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            bleClient.telemetry.collect { tick ->
+                if (_realtimeState.value.connectionSource != ConnectionSource.BLE) return@collect
+                onBleTelemetryTick(tick)
+            }
+        }
+    }
+
+    private fun onBleTelemetryTick(tick: Telemetry) {
+        val currentState = _realtimeState.value
+        val incomingOutletId = tick.outletId.trim()
+        val effectiveOutletId = incomingOutletId.ifBlank { currentState.outletId }
+        val outletChanged = effectiveOutletId.isNotBlank() && effectiveOutletId != currentState.outletId
+
+        val rfid = tick.applianceRfid // null when "NONE"
+        val rfidForUi = rfid ?: "NONE"
+        val rfidChanged = rfid != lastStreamRfid
+        lastStreamRfid = rfid
+
+        val cachedDisplayName = if (rfid != null) applianceNameCache[rfid] else null
+        val displayNameForUi = when {
+            rfid == null -> null
+            cachedDisplayName != null -> cachedDisplayName
+            !rfidChanged && currentState.activeApplianceRfid == rfid ->
+                currentState.activeApplianceDisplayName ?: rfid
+            else -> rfid
+        }
+
+        _realtimeState.update { state ->
+            state.copy(
+                isConnected = true,
+                outletId = effectiveOutletId,
+                outletCustomName = if (outletChanged) null else state.outletCustomName,
+                watts = tick.power,
+                voltage = tick.voltage,
+                current = tick.current,
+                energyWh = tick.energyWh,
+                frequency = tick.frequency,
+                powerFactor = tick.powerFactor,
+                activeApplianceRfid = rfidForUi,
+                activeApplianceDisplayName = displayNameForUi
+            )
+        }
+
+        if (outletChanged || (effectiveOutletId.isNotBlank() && effectiveOutletId != lastResolvedOutletId)) {
+            lastResolvedOutletId = effectiveOutletId
+            resolveOutletName(effectiveOutletId)
+        }
+
+        if (rfid == null) {
+            applianceLookupJob?.cancel()
+            applianceLookupJob = null
+        } else if (rfidChanged && cachedDisplayName == null) {
+            resolveApplianceNameForStream(rfid)
+        }
+    }
 
     fun showDemoPlaceholderSnackbar() {
         sendSnackbar("Not available in this demo yet")
@@ -135,12 +351,108 @@ class KilowhatViewModel(
     // Real-Time Tab Actions
     // ========================================================================
 
-    fun connectDemoScript() {
-        if (_realtimeState.value.isPairing || _realtimeState.value.isConnected) return
+    fun connectManualBluetooth() {
+        stopDemoStreamInternal(unpairIfConnected = true)
+        resetStreamLookupTracking()
 
-        _realtimeState.update {
-            it.copy(isPairing = true, connectionError = null)
+        _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.BLE,
+            bleState = BleState.Scanning,
+            isConnected = false,
+            isPairing = false,
+            connectionError = null,
+            isPermissionDenied = false,
+            isStreamStale = false,
+            energyWh = 0.0,
+            frequency = 0.0,
+            powerFactor = 0.0
+        )
+
+        bleClient.start()
+    }
+
+    fun onBlePermissionDenied() {
+        stopDemoStreamInternal(unpairIfConnected = true)
+        bleClient.stop()
+        resetStreamLookupTracking()
+
+        val msg = "Bluetooth permissions are required to scan and connect to the Kilowhat adapter."
+        _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.BLE,
+            bleState = BleState.Error(msg),
+            isConnected = false,
+            isPairing = false,
+            connectionError = msg,
+            isPermissionDenied = true
+        )
+    }
+
+    fun onBluetoothEnableDeclined() {
+        if (_realtimeState.value.connectionSource == ConnectionSource.DEMO_SCRIPT &&
+            _realtimeState.value.isConnected
+        ) {
+            sendSnackbar("Bluetooth must be enabled to switch to BLE.")
+            return
         }
+        bleClient.stop()
+        resetStreamLookupTracking()
+        val msg = "Bluetooth is turned off. Enable Bluetooth to connect to the Kilowhat adapter."
+        _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.BLE,
+            bleState = BleState.Error(msg),
+            isConnected = false,
+            isPairing = false,
+            connectionError = msg,
+            isPermissionDenied = false
+        )
+    }
+
+    fun onBleHardwareUnavailable() {
+        val msg = "This device does not support Bluetooth Low Energy (BLE). Use Demo PY Script mode instead."
+        if (_realtimeState.value.connectionSource == ConnectionSource.DEMO_SCRIPT &&
+            _realtimeState.value.isConnected
+        ) {
+            sendSnackbar(msg)
+            return
+        }
+        bleClient.stop()
+        resetStreamLookupTracking()
+        _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.NONE,
+            bleState = BleState.Error(msg),
+            isConnected = false,
+            isPairing = false,
+            connectionError = msg,
+            isPermissionDenied = false
+        )
+        sendSnackbar(msg)
+    }
+
+    fun connectDemoScript() {
+        val current = _realtimeState.value
+        if (current.connectionSource == ConnectionSource.DEMO_SCRIPT &&
+            (current.isPairing || current.isConnected)
+        ) {
+            return
+        }
+
+        // Stop BLE so only one source is active at a time.
+        bleClient.stop()
+        stopDemoStreamInternal(unpairIfConnected = false)
+        resetStreamLookupTracking()
+
+        _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.DEMO_SCRIPT,
+            bleState = BleState.Idle,
+            isConnected = false,
+            isPairing = true,
+            connectionError = null,
+            isPermissionDenied = false,
+            isStreamStale = false,
+            energyWh = null,
+            frequency = null,
+            powerFactor = null
+        )
 
         viewModelScope.launch {
             when (val result = repository.pairSimulator()) {
@@ -148,6 +460,8 @@ class KilowhatViewModel(
                     val pairedOutletId = result.data.outletId.trim()
                     _realtimeState.update {
                         RealtimeUiState(
+                            connectionSource = ConnectionSource.DEMO_SCRIPT,
+                            bleState = BleState.Idle,
                             isConnected = true,
                             isPairing = false,
                             connectionError = null,
@@ -155,6 +469,7 @@ class KilowhatViewModel(
                         )
                     }
                     if (pairedOutletId.isNotEmpty()) {
+                        lastResolvedOutletId = pairedOutletId
                         resolveOutletName(pairedOutletId)
                     }
                     startBleStreamLoop()
@@ -178,16 +493,40 @@ class KilowhatViewModel(
     }
 
     fun disconnect() {
+        val wasDemoMode = _realtimeState.value.connectionSource == ConnectionSource.DEMO_SCRIPT
         streamJob?.cancel()
         streamJob = null
-        outletLookupIdInFlight = null
+        bleClient.stop()
+        resetStreamLookupTracking()
 
         _realtimeState.value = RealtimeUiState()
 
-        // Best-effort unpair call; failures are intentionally ignored per specification.
-        viewModelScope.launch {
-            repository.unpairSimulator()
+        if (wasDemoMode) {
+            // Best-effort unpair call; failures are intentionally ignored per specification.
+            viewModelScope.launch {
+                repository.unpairSimulator()
+            }
         }
+    }
+
+    private fun stopDemoStreamInternal(unpairIfConnected: Boolean) {
+        val wasDemoConnected = _realtimeState.value.connectionSource == ConnectionSource.DEMO_SCRIPT &&
+            _realtimeState.value.isConnected
+        streamJob?.cancel()
+        streamJob = null
+        if (unpairIfConnected && wasDemoConnected) {
+            viewModelScope.launch {
+                repository.unpairSimulator()
+            }
+        }
+    }
+
+    private fun resetStreamLookupTracking() {
+        applianceLookupJob?.cancel()
+        applianceLookupJob = null
+        outletLookupIdInFlight = null
+        lastStreamRfid = null
+        lastResolvedOutletId = null
     }
 
     private fun startBleStreamLoop() {
@@ -204,14 +543,30 @@ class KilowhatViewModel(
                         val currentState = _realtimeState.value
 
                         val effectiveOutletId = currentState.outletId.ifBlank { incomingOutletId }
-                        if (currentState.outletId.isBlank() && effectiveOutletId.isNotBlank()) {
+                        if (effectiveOutletId.isNotBlank() && effectiveOutletId != lastResolvedOutletId) {
+                            lastResolvedOutletId = effectiveOutletId
                             resolveOutletName(effectiveOutletId)
                         }
 
-                        val rfid = reading.activeApplianceRfid.trim().ifEmpty { "NONE" }
-                        val isPluggedIn = !rfid.equals("NONE", ignoreCase = true)
+                        val rawRfid = reading.activeApplianceRfid.trim().ifEmpty { "NONE" }
+                        val isPluggedIn = !rawRfid.equals("NONE", ignoreCase = true)
+                        val normalizedRfid = if (isPluggedIn) rawRfid else null
+                        val rfidChanged = normalizedRfid != lastStreamRfid
+                        lastStreamRfid = normalizedRfid
 
-                        val cachedDisplayName = if (isPluggedIn) applianceNameCache[rfid] else null
+                        val cachedDisplayName = if (normalizedRfid != null) {
+                            applianceNameCache[normalizedRfid]
+                        } else {
+                            null
+                        }
+
+                        val displayNameForUi = when {
+                            normalizedRfid == null -> null
+                            cachedDisplayName != null -> cachedDisplayName
+                            !rfidChanged && currentState.activeApplianceRfid == normalizedRfid ->
+                                currentState.activeApplianceDisplayName ?: normalizedRfid
+                            else -> normalizedRfid
+                        }
 
                         _realtimeState.update { state ->
                             state.copy(
@@ -219,17 +574,16 @@ class KilowhatViewModel(
                                 watts = reading.watts,
                                 voltage = reading.voltage,
                                 current = reading.current,
-                                activeApplianceRfid = rfid,
-                                activeApplianceDisplayName = if (isPluggedIn) {
-                                    cachedDisplayName ?: rfid
-                                } else {
-                                    null
-                                }
+                                activeApplianceRfid = rawRfid,
+                                activeApplianceDisplayName = displayNameForUi
                             )
                         }
 
-                        if (isPluggedIn && cachedDisplayName == null) {
-                            resolveApplianceNameForStream(rfid)
+                        if (normalizedRfid == null) {
+                            applianceLookupJob?.cancel()
+                            applianceLookupJob = null
+                        } else if (rfidChanged && cachedDisplayName == null) {
+                            resolveApplianceNameForStream(normalizedRfid)
                         }
                     }
 
@@ -262,8 +616,9 @@ class KilowhatViewModel(
     private fun returnToDisconnected(reason: String) {
         streamJob?.cancel()
         streamJob = null
-        outletLookupIdInFlight = null
+        resetStreamLookupTracking()
         _realtimeState.value = RealtimeUiState(
+            connectionSource = ConnectionSource.DEMO_SCRIPT,
             isConnected = false,
             connectionError = reason
         )
@@ -271,7 +626,8 @@ class KilowhatViewModel(
     }
 
     private fun resolveApplianceNameForStream(rfid: String) {
-        viewModelScope.launch {
+        applianceLookupJob?.cancel()
+        applianceLookupJob = viewModelScope.launch {
             when (val res = repository.lookupAppliance(rfid)) {
                 is ApiResult.Success -> {
                     val displayName = res.data.displayName.ifBlank { rfid }
@@ -285,7 +641,7 @@ class KilowhatViewModel(
                     }
                 }
                 else -> {
-                    // Leave uncached so the next tick retries cleanly.
+                    // Keep showing raw RFID until the RFID changes again.
                 }
             }
         }
@@ -676,8 +1032,9 @@ class KilowhatViewModel(
                 is ApiResult.Success -> {
                     val saved = res.data
 
-                    // 1. Clear the Real-Time RFID name cache so any rename shows on the next tick.
+                    // 1. Update the Real-Time RFID name cache so any rename shows immediately.
                     applianceNameCache.clear()
+                    applianceNameCache[saved.applianceRfid] = saved.displayName
 
                     // If the renamed tag is currently plugged in on the Real-Time tab, update it immediately.
                     _realtimeState.update { rt ->
@@ -769,6 +1126,7 @@ class KilowhatViewModel(
 
     override fun onCleared() {
         streamJob?.cancel()
+        bleClient.stop()
         super.onCleared()
     }
 }

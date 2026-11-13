@@ -28,6 +28,8 @@ import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Nfc
 import androidx.compose.material.icons.outlined.Power
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
@@ -52,6 +54,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.kilowhat.app.data.ble.BleState
+import com.kilowhat.app.data.ble.KilowhatBleClient
+import com.kilowhat.app.ui.ConnectionSource
 import com.kilowhat.app.ui.RealtimeUiState
 import com.kilowhat.app.ui.theme.AmberWarning
 import com.kilowhat.app.ui.theme.AmberWarningContainer
@@ -71,6 +76,7 @@ fun RealtimeScreen(
     onManualBluetoothClick: () -> Unit,
     onConnectDemoScript: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpenAppSettings: () -> Unit,
     onEditOutletClick: () -> Unit,
     onDismissEditOutlet: () -> Unit,
     onSaveOutletName: (String) -> Unit,
@@ -99,13 +105,16 @@ fun RealtimeScreen(
                 state = state,
                 onNfcClick = onNfcClick,
                 onManualBluetoothClick = onManualBluetoothClick,
-                onConnectDemoScript = onConnectDemoScript
+                onConnectDemoScript = onConnectDemoScript,
+                onDisconnect = onDisconnect,
+                onOpenAppSettings = onOpenAppSettings
             )
         } else {
             ConnectedRealtimeContent(
                 state = state,
                 onNfcClick = onNfcClick,
                 onManualBluetoothClick = onManualBluetoothClick,
+                onConnectDemoScript = onConnectDemoScript,
                 onEditOutletClick = onEditOutletClick,
                 onDisconnect = onDisconnect
             )
@@ -118,8 +127,55 @@ private fun DisconnectedRealtimeContent(
     state: RealtimeUiState,
     onNfcClick: () -> Unit,
     onManualBluetoothClick: () -> Unit,
-    onConnectDemoScript: () -> Unit
+    onConnectDemoScript: () -> Unit,
+    onDisconnect: () -> Unit,
+    onOpenAppSettings: () -> Unit
 ) {
+    val (statusDotColor, statusPillContainer, statusTextColor, statusLabel) = when {
+        state.connectionSource == ConnectionSource.BLE && state.bleState is BleState.Scanning ->
+            StatusBadgeStyle(
+                dotColor = MaterialTheme.colorScheme.primary,
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                textColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                label = "Scanning"
+            )
+        state.connectionSource == ConnectionSource.BLE && state.bleState is BleState.Connecting ->
+            StatusBadgeStyle(
+                dotColor = MaterialTheme.colorScheme.primary,
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                textColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                label = "Connecting"
+            )
+        state.connectionSource == ConnectionSource.BLE && state.bleState is BleState.Reconnecting ->
+            StatusBadgeStyle(
+                dotColor = AmberWarning,
+                containerColor = AmberWarningContainer,
+                textColor = AmberWarning,
+                label = "Reconnecting (attempt ${state.bleState.attempt})"
+            )
+        state.isPairing ->
+            StatusBadgeStyle(
+                dotColor = MaterialTheme.colorScheme.primary,
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                textColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                label = "Connecting"
+            )
+        !state.connectionError.isNullOrBlank() || state.bleState is BleState.Error ->
+            StatusBadgeStyle(
+                dotColor = MaterialTheme.colorScheme.error,
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+                textColor = MaterialTheme.colorScheme.onErrorContainer,
+                label = "Error"
+            )
+        else ->
+            StatusBadgeStyle(
+                dotColor = MaterialTheme.colorScheme.outline,
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                label = "DISCONNECTED"
+            )
+    }
+
     // Hero instructions card
     Card(
         shape = RoundedCornerShape(24.dp),
@@ -155,7 +211,7 @@ private fun DisconnectedRealtimeContent(
                 }
                 Column {
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        color = statusPillContainer,
                         shape = CircleShape
                     ) {
                         Row(
@@ -166,13 +222,13 @@ private fun DisconnectedRealtimeContent(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(MaterialTheme.colorScheme.outline)
+                                    .background(statusDotColor)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "DISCONNECTED",
+                                text = statusLabel,
                                 style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = statusTextColor
                             )
                         }
                     }
@@ -185,14 +241,85 @@ private fun DisconnectedRealtimeContent(
             }
 
             Text(
-                text = "Pair with a Kilowhat smart outlet adapter to stream real-time power draw (Watts, Volts, Amperes) and automatically identify plugged-in appliances by their RFID tag.",
+                text = "Pair with a Kilowhat smart outlet adapter over BLE or the Demo Python script to stream real-time power draw (Watts, Volts, Amperes) and automatically identify plugged-in appliances by their RFID tag.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
 
-    // Error alert banner if pairing failed or stream disconnected
+    // BLE active connection progress card (Scanning, Connecting, Reconnecting)
+    AnimatedVisibility(
+        visible = state.isBleBusy,
+        enter = fadeIn(),
+        exit = fadeOut()
+    ) {
+        val progressMessage = when (val bleState = state.bleState) {
+            is BleState.Scanning -> "Scanning for Kilowhat adapter…"
+            is BleState.Connecting -> "Connecting to Kilowhat adapter…"
+            is BleState.Reconnecting -> "Reconnecting to adapter (attempt ${bleState.attempt})…"
+            else -> "Connecting…"
+        }
+        val dotColor = if (state.bleState is BleState.Reconnecting) {
+            AmberWarning
+        } else {
+            MaterialTheme.colorScheme.primary
+        }
+
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    strokeWidth = 2.5.dp,
+                    color = dotColor
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(dotColor)
+                        )
+                        Text(
+                            text = statusLabel,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Text(
+                        text = progressMessage,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(
+                    onClick = onDisconnect,
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Cancel")
+                }
+            }
+        }
+    }
+
+    // Error alert banner with Retry (and Open Settings when permissions were denied)
     AnimatedVisibility(
         visible = !state.connectionError.isNullOrBlank(),
         enter = fadeIn(),
@@ -205,29 +332,95 @@ private fun DisconnectedRealtimeContent(
             ),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.ErrorOutline,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onErrorContainer
-                )
-                Text(
-                    text = state.connectionError.orEmpty(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.weight(1f)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ErrorOutline,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.error)
+                            )
+                            Text(
+                                text = "Error",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = state.connectionError.orEmpty(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (state.isPermissionDenied) {
+                        OutlinedButton(
+                            onClick = onOpenAppSettings,
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Settings,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("App Settings")
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            if (state.connectionSource == ConnectionSource.DEMO_SCRIPT) {
+                                onConnectDemoScript()
+                            } else {
+                                onManualBluetoothClick()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Retry")
+                    }
+                }
             }
         }
     }
 
-    // Connection methods card with exact button labels
+    // Connection methods card
     Card(
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
@@ -280,7 +473,7 @@ private fun DisconnectedRealtimeContent(
 
             FilledTonalButton(
                 onClick = onNfcClick,
-                enabled = !state.isPairing,
+                enabled = false,
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -300,22 +493,41 @@ private fun DisconnectedRealtimeContent(
 
             OutlinedButton(
                 onClick = onManualBluetoothClick,
-                enabled = !state.isPairing,
+                enabled = !state.isPairing && !state.isBleBusy,
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.Bluetooth,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = "Manual Bluetooth Connection",
-                    style = MaterialTheme.typography.labelLarge
-                )
+                if (state.isBleBusy) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    val busyLabel = when (val bleState = state.bleState) {
+                        is BleState.Scanning -> "Scanning…"
+                        is BleState.Connecting -> "Connecting…"
+                        is BleState.Reconnecting -> "Reconnecting (attempt ${bleState.attempt})…"
+                        else -> "Connecting…"
+                    }
+                    Text(
+                        text = busyLabel,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Outlined.Bluetooth,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Manual Bluetooth Connection",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
             }
         }
     }
@@ -326,9 +538,31 @@ private fun ConnectedRealtimeContent(
     state: RealtimeUiState,
     onNfcClick: () -> Unit,
     onManualBluetoothClick: () -> Unit,
+    onConnectDemoScript: () -> Unit,
     onEditOutletClick: () -> Unit,
     onDisconnect: () -> Unit
 ) {
+    val isBleSource = state.connectionSource == ConnectionSource.BLE
+    val connectedDeviceName = when (val bleState = state.bleState) {
+        is BleState.Connected -> bleState.deviceName
+        else -> if (state.outletId.isNotBlank()) {
+            "${KilowhatBleClient.DEVICE_NAME_PREFIX}${state.outletId}"
+        } else {
+            KilowhatBleClient.DEFAULT_DEVICE_NAME
+        }
+    }
+
+    val (headerDotColor, headerStatusText) = when {
+        isBleSource && state.bleState is BleState.Reconnecting ->
+            AmberWarning to "Reconnecting (attempt ${state.bleState.attempt})"
+        isBleSource && state.isStreamStale ->
+            AmberWarning to "Connected to $connectedDeviceName • No data from adapter"
+        isBleSource ->
+            MaterialTheme.colorScheme.primary to "Connected to $connectedDeviceName"
+        else ->
+            MaterialTheme.colorScheme.primary to "LIVE STREAM • 1 Hz"
+    }
+
     // 1. Outlet Header Card with Edit Button
     Card(
         shape = RoundedCornerShape(24.dp),
@@ -357,12 +591,12 @@ private fun ConnectedRealtimeContent(
                         modifier = Modifier
                             .size(9.dp)
                             .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary)
+                            .background(headerDotColor)
                     )
                     Text(
-                        text = "LIVE STREAM • 1 Hz",
+                        text = headerStatusText,
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
+                        color = headerDotColor
                     )
                 }
 
@@ -389,6 +623,63 @@ private fun ConnectedRealtimeContent(
                     imageVector = Icons.Outlined.Edit,
                     contentDescription = "Edit Outlet Name",
                     tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+
+    // Stale stream or Reconnecting banner while viewing live telemetry
+    AnimatedVisibility(
+        visible = isBleSource && (state.isStreamStale || state.bleState is BleState.Reconnecting),
+        enter = fadeIn(),
+        exit = fadeOut()
+    ) {
+        val bannerText = when (val bleState = state.bleState) {
+            is BleState.Reconnecting ->
+                "Connection interrupted. Reconnecting (attempt ${bleState.attempt})…"
+            else ->
+                "No data from adapter"
+        }
+
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = AmberWarningContainer
+            ),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (state.bleState is BleState.Reconnecting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = AmberWarning
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Outlined.WarningAmber,
+                        contentDescription = null,
+                        tint = AmberWarning,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(AmberWarning)
+                )
+                Text(
+                    text = bannerText,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color(0xFF92400E),
+                    modifier = Modifier.weight(1f)
                 )
             }
         }
@@ -490,6 +781,20 @@ private fun ConnectedRealtimeContent(
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color(0xFFD1FAE5)
                 )
+
+                if (state.energyWh != null && state.frequency != null && state.powerFactor != null) {
+                    Text(
+                        text = String.format(
+                            Locale.US,
+                            "Energy: %.3f Wh  •  %.1f Hz  •  PF: %.2f",
+                            state.energyWh,
+                            state.frequency,
+                            state.powerFactor
+                        ),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFA7F3D0)
+                    )
+                }
             }
         }
     }
@@ -603,7 +908,7 @@ private fun ConnectedRealtimeContent(
         }
     }
 
-    // 4. Connection Controls (NFC & Bluetooth visible but disabled; Disconnect button active)
+    // 4. Connection Controls (Switch source or Disconnect)
     Card(
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
@@ -622,6 +927,24 @@ private fun ConnectedRealtimeContent(
                 text = "Connection Controls",
                 style = MaterialTheme.typography.titleMedium
             )
+
+            if (isBleSource) {
+                OutlinedButton(
+                    onClick = onConnectDemoScript,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Terminal,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Switch to Demo PY Script")
+                }
+            }
 
             FilledTonalButton(
                 onClick = onNfcClick,
@@ -642,7 +965,7 @@ private fun ConnectedRealtimeContent(
 
             OutlinedButton(
                 onClick = onManualBluetoothClick,
-                enabled = false,
+                enabled = !isBleSource,
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -683,6 +1006,13 @@ private fun ConnectedRealtimeContent(
     }
 }
 
+private data class StatusBadgeStyle(
+    val dotColor: Color,
+    val containerColor: Color,
+    val textColor: Color,
+    val label: String
+)
+
 @Composable
 private fun TelemetryMetricCard(
     label: String,
@@ -707,7 +1037,7 @@ private fun TelemetryMetricCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
                 text = label.uppercase(Locale.US),
